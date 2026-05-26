@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>LangGraph Visualizer (Regex Engine)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #1e1e2e;
+            color: #cdd6f4;
+            margin: 0;
+            padding: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            color: #89b4fa;
+            margin-bottom: 5px;
+        }
+
+        #cy {
+            width: 92vw;
+            height: 80vh;
+            margin: 20px auto;
+            border: 2px solid #45475a;
+            background: #11111b;
+            border-radius: 12px;
+        }
+
+        .status {
+            text-align: center;
+            color: #a6adc8;
+            font-size: 14px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>LangGraph Canvas</h1>
+    <div class="status" id="status-msg">Connected to Neovim. Waiting for data...</div>
+    <div id="cy"></div>
+
+    <script>
+        const ws = new WebSocket('ws://127.0.0.1:8055');
+        const statusMsg = document.getElementById('status-msg');
+
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "RENDER_CODE") {
+                generateGraphRegex(msg.code);
+            }
+        };
+
+        function generateGraphRegex(code) {
+            const elements = [];
+            const foundNodes = new Set();
+            let edgeCounter = 0;
+
+            // 1. Pre-process code: Strip comments and flatten whitespace/newlines
+            const cleanCode = code.replace(/#.*$/gm, '').replace(/\s+/g, ' ');
+
+            // 2. Parse Nodes: .add_node("name", ...)
+            const nodeRegex = /\.add_node\s*\(\s*(['"]?)([^,\s'"]+)\1/g;
+            let match;
+            while ((match = nodeRegex.exec(cleanCode)) !== null) {
+                const nodeName = match[2];
+                if (!foundNodes.has(nodeName)) {
+                    foundNodes.add(nodeName);
+                    elements.push({data: {id: nodeName, label: nodeName, type: 'standard'}});
+                }
+            }
+
+            // 3. NEW: Parse Entry Point -> .set_entry_point("node_name")
+            const entryRegex = /\.set_entry_point\s*\(\s*(['"]?)([^)\s'"]+)\1/g;
+            let entryMatch = entryRegex.exec(cleanCode);
+            if (entryMatch) {
+                const entryNode = entryMatch[2];
+
+                // Ensure the START node exists
+                foundNodes.add('START');
+                elements.push({data: {id: 'START', label: 'START', type: 'entry'}});
+
+                // Ensure the targeted node exists in our graph array
+                ensureNodeExists(entryNode, foundNodes, elements);
+
+                // Draw a distinct edge from START to the entry node
+                elements.push({
+                    data: {
+                        id: 'e_start',
+                        source: 'START',
+                        target: entryNode,
+                        style: 'solid'
+                    }
+                });
+            }
+
+            // 4. Parse Standard Edges: .add_edge("source", "target")
+            const edgeRegex = /\.add_edge\s*\(\s*(['"]?)([^,\s'"]+)\1\s*,\s*(['"]?)([^,\s'"]+)\3/g;
+            let edgeMatch;
+            while ((edgeMatch = edgeRegex.exec(cleanCode)) !== null) {
+                const source = edgeMatch[2];
+                const target = edgeMatch[4];
+
+                ensureNodeExists(source, foundNodes, elements);
+                ensureNodeExists(target, foundNodes, elements);
+                elements.push({data: {id: 'e' + (edgeCounter++), source, target, style: 'solid'}});
+            }
+
+            // 5. Robust Conditional Edge Regex: Catches .add_conditional_edges("source", fn, { ... })
+            const condRegex = /\.add_conditional_edges\s*\(\s*(['"]?)([^,\s'"]+)\1\s*,\s*[^,]+\s*,\s*\{([^}]+)\}/g;
+            let condMatch;
+            while ((condMatch = condRegex.exec(cleanCode)) !== null) {
+                const source = condMatch[2];
+                const rawDict = condMatch[3]; // e.g., "continue": "tools", "end": END
+
+                ensureNodeExists(source, foundNodes, elements);
+
+                // Enhanced Regex: Captures both the key (condition) and the value (target)
+                // Group 2 matches the key, Group 4 matches the value
+                const destRegex = /(['"]?)([^:\s'"]+)\1\s*:\s*(['"]?)([^,\s'"]+)\3/g;
+                let destMatch;
+                while ((destMatch = destRegex.exec(rawDict)) !== null) {
+                    const conditionLabel = destMatch[2]; // e.g., "continue"
+                    const target = destMatch[4];         // e.g., "tools"
+
+                    ensureNodeExists(target, foundNodes, elements);
+
+                    elements.push({
+                        data: {
+                            id: 'e' + (edgeCounter++),
+                            source: source,
+                            target: target,
+                            style: 'dashed',
+                            label: conditionLabel // Sets the routing path text on the edge!
+                        }
+                    });
+                }
+            }
+
+            if (elements.length === 0) {
+                elements.push({data: {id: 'empty', label: 'Waiting for .add_node() patterns...', type: 'standard'}});
+            }
+
+            statusMsg.innerText = `Graph updated! Rendered ${foundNodes.size} structural nodes.`;
+            renderCanvas(elements);
+        }
+
+        function ensureNodeExists(nodeId, set, elementsList) {
+            if (!set.has(nodeId)) {
+                set.add(nodeId);
+                const isTerminal = nodeId === 'END' || nodeId === '__end__';
+                elementsList.push({data: {id: nodeId, label: nodeId, type: isTerminal ? 'terminal' : 'standard'}});
+            }
+        }
+
+        function renderCanvas(elements) {
+            cytoscape({
+                container: document.getElementById('cy'),
+                elements: elements,
+                wheelSensitivity: 0.15,
+                style: [
+                    {
+                        selector: 'node[type="entry"]', // Special configuration styling for the START node
+                        style: {
+                            'background-color': '#89b4fa',
+                            'label': 'data(label)',
+                            'color': '#11111b',
+                            'text-valign': 'center',
+                            'font-size': '13px',
+                            'font-weight': 'bold',
+                            'shape': 'ellipse',
+                            'width': '65px',
+                            'height': '65px'
+                        }
+                    },
+                    {
+                        selector: 'node[type="standard"]',
+                        style: {
+                            'background-color': '#a6e3a1',
+                            'label': 'data(label)',
+                            'color': '#11111b',
+                            'text-valign': 'center',
+                            'font-size': '13px',
+                            'font-weight': 'bold',
+                            'shape': 'round-rectangle',
+                            'width': '140px',
+                            'height': '45px'
+                        }
+                    },
+                    {
+                        selector: 'node[type="terminal"]',
+                        style: {
+                            'background-color': '#f38ba8',
+                            'label': 'data(label)',
+                            'color': '#11111b',
+                            'text-valign': 'center',
+                            'font-size': '13px',
+                            'font-weight': 'bold',
+                            'shape': 'ellipse',
+                            'width': '65px',
+                            'height': '65px'
+                        }
+                    },
+                    {
+                        selector: 'edge[style="solid"]',
+                        style: {
+                            'width': 3,
+                            'line-color': '#89b4fa',
+                            'target-arrow-color': '#89b4fa',
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'bezier'
+                        }
+                    },
+                    {
+                        selector: 'edge[style="dashed"]',
+                        style: {
+                            'width': 3,
+                            'line-color': '#f9e2af',
+                            'line-style': 'dashed',
+                            'target-arrow-color': '#f9e2af',
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'bezier',
+                            'label': 'data(label)',
+                            'font-size': '10px',
+                            'color': '#cdd6f4',
+                            'text-background-opacity': 0.8,
+                            'text-background-color': '#11111b',
+                            'text-background-padding': '3px'
+                        }
+                    }
+                ],
+                layout: {name: 'breadthfirst', directed: true, padding: 40}
+            });
+        }
+    </script>
+</body>
+
+</html>
